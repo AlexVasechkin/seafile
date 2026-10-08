@@ -30,12 +30,13 @@
 
 Каждый файл обрабатывается независимо: ошибка с одним файлом не мешает остальным.
 Код выхода: 0 — всё в порядке (отсутствующие файлы — не ошибка), 1 — была ошибка,
-2 — неверная конфигурация.
+2 — неверная конфигурация, 3 — предыдущий запуск ещё работает.
 """
 import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -111,6 +112,12 @@ _CURL_ENV_KEYS = (
 )
 CURL_ENV = {k: os.environ[k] for k in _CURL_ENV_KEYS if k in os.environ}
 
+# curl ищется один раз и только по абсолютному пути: относительный элемент в PATH
+# (или каталог, доступный на запись) иначе позволил бы подставить свой curl.
+CURL = shutil.which("curl", path=CURL_ENV.get("PATH", os.defpath))
+if not CURL or not os.path.isabs(CURL):
+    fail_config("curl не найден в PATH либо найден не по абсолютному пути")
+
 
 def get_paths():
     """Список удалённых путей: аргументы > SEAFILE_PATHS > SEAFILE_PATH."""
@@ -126,6 +133,12 @@ def get_paths():
         p = p.strip()
         if not p:
             continue
+        # argv и SEAFILE_PATHS читаются минуя env(), поэтому проверяем здесь:
+        # управляющие символы иначе попадут в лог и в имя локального файла.
+        try:
+            check_value(p, f"путь {p!r}")
+        except ValueError as e:
+            fail_config(str(e))
         if not p.startswith("/"):
             p = "/" + p
         if p not in seen:  # убираем точные дубликаты
@@ -168,11 +181,12 @@ def cfg_quote(value):
 
 
 def curl(url, method="GET", output=None, connect_timeout=10, max_time=300,
-         auth=True, form=None):
+         auth=True, form=None, max_filesize=None):
     """Вызывает curl. Токен, логин и пароль передаются через stdin (-K -),
     чтобы не светиться ни в ps, ни в окружении. Возвращает (http_code, body_bytes).
     При output тело пишется в файл, body == b''.
     form — dict полей x-www-form-urlencoded для POST.
+    max_filesize — предел размера ответа в байтах (защита от переполнения диска).
     Любой запрос разрешён только на https-хост из SEAFILE_URL."""
     if not is_trusted_url(url):
         raise ValueError("запрос на непроверенный адрес заблокирован")
@@ -183,7 +197,7 @@ def curl(url, method="GET", output=None, connect_timeout=10, max_time=300,
         for k, v in form.items():
             config += f"data-urlencode = {cfg_quote(f'{k}={v}')}\n"
     cmd = [
-        "curl", "-q",                      # -q строго первым: не читать ~/.curlrc
+        CURL, "-q",                        # -q строго первым: не читать ~/.curlrc
         "-sS",
         "--proto", "=https",               # никаких http и прочих протоколов
         "-K", "-",
@@ -191,8 +205,10 @@ def curl(url, method="GET", output=None, connect_timeout=10, max_time=300,
         "-X", method,
         "-w", "%{http_code}",
         "-o", output if output else "-",
-        "--url", url,                      # --url: адрес не может быть принят за опцию
     ]
+    if max_filesize is not None:
+        cmd += ["--max-filesize", str(max_filesize)]
+    cmd += ["--url", url]                  # --url: адрес не может быть принят за опцию
     res = subprocess.run(cmd, input=config.encode(), capture_output=True, env=CURL_ENV)
     if res.returncode != 0:
         raise RuntimeError(f"curl завершился с кодом {res.returncode}: "
@@ -308,7 +324,10 @@ def process_file(remote_path):
     fd, tmp_path = tempfile.mkstemp(dir=DEST_DIR, prefix=f".{file_name}.", suffix=".part")
     os.close(fd)
     try:
-        code, _ = curl(dl_url, output=tmp_path, auth=False)
+        # Предел размера: оборвать загрузку, если сервер отдаёт больше обещанного,
+        # не дожидаясь заполнения диска (для пустого файла предел не ставим).
+        code, _ = curl(dl_url, output=tmp_path, auth=False,
+                       max_filesize=remote_size if remote_size > 0 else None)
         if code != 200:
             log(f"{tag} ОШИБКА: скачивание вернуло HTTP {code}")
             return "error"
@@ -319,12 +338,13 @@ def process_file(remote_path):
             log(f"{tag} ОШИБКА: размер не совпал (локально {local_size}, в Seafile {remote_size})")
             return "error"
 
-        # 5. Атомарная замена. mkstemp создаёт файл с правами 600 — выставляем
-        # права по umask процесса (как у обычного нового файла), чтобы файл
-        # могли читать другие сервисы.
+        # 5. Атомарная замена. mkstemp создаёт файл с правами 600 — открываем
+        # его на чтение по umask процесса, чтобы файл могли читать другие
+        # сервисы. Запись остаётся только владельцу: при umask 000 база 0o666
+        # дала бы файл, доступный на запись всем.
         umask = os.umask(0)
         os.umask(umask)
-        os.chmod(tmp_path, 0o666 & ~umask)
+        os.chmod(tmp_path, 0o644 & ~umask)
         os.replace(tmp_path, dest)
         log(f"{tag} Файл скачан: {dest} ({local_size} байт)")
     finally:
@@ -340,18 +360,36 @@ def process_file(remote_path):
     return "downloaded"
 
 
+def lock_dir():
+    """Приватный каталог для lock-файла. В общей /tmp посторонний может заранее
+    создать файл с таким именем и держать его заблокированным (или закрыть к нему
+    доступ), и запуски будут молча пропускаться."""
+    for d in (os.environ.get("XDG_RUNTIME_DIR"), f"/run/user/{os.getuid()}", DEST_DIR):
+        if d and os.path.isdir(d) and os.access(d, os.W_OK):
+            return d
+    return DEST_DIR
+
+
 def main():
     paths = get_paths()
 
     # Защита от параллельных запусков. O_NOFOLLOW: не следовать симлинку,
-    # подставленному на место lock-файла в общей папке /tmp.
-    lock_path = os.path.join(tempfile.gettempdir(), f"seafile_fetch_{REPO}.lock")
-    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    # подставленному на место lock-файла.
+    lock_path = os.path.join(lock_dir(), f".seafile_fetch_{REPO}.lock")
+    try:
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    except OSError as e:
+        log(f"ОШИБКА: не удалось открыть lock-файл {lock_path}: {e}")
+        return 2
+    if os.fstat(lock_fd).st_uid != os.getuid():
+        log(f"ОШИБКА: lock-файл {lock_path} принадлежит другому пользователю")
+        return 2
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
+        # Код 3, а не 0: иначе навсегда занятый lock выглядит для cron как успех.
         log("Предыдущий запуск ещё работает, выходим")
-        return 0
+        return 3
 
     # 0. Проверка доступности Seafile и аутентификация (один раз на все файлы)
     if not check_seafile_available():
